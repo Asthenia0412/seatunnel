@@ -1509,35 +1509,39 @@ public class CheckpointCoordinator {
     }
 
     private synchronized void updateStatus(@NonNull CheckpointCoordinatorStatus targetStatus) {
+        boolean locked = false;
         try {
-            RetryUtils.retryWithException(
-                    () -> {
-                        Object currentStatus = runningJobStateIMap.get(checkpointStateImapKey);
-                        if (currentStatus == null) {
-                            LOG.warn(
-                                    String.format(
-                                            "%s has already been cleaned, skip persisting transition to %s",
-                                            checkpointStateImapKey, targetStatus));
-                            return null;
-                        }
-                        LOG.info(
-                                "Turn {} state from {} to {}",
-                                checkpointStateImapKey,
-                                currentStatus,
-                                targetStatus);
-                        runningJobStateIMap.set(checkpointStateImapKey, targetStatus);
-                        return null;
-                    },
-                    new RetryUtils.RetryMaterial(
-                            Constant.OPERATION_RETRY_TIME,
-                            true,
-                            ExceptionUtil::isOperationNeedRetryException,
-                            Constant.OPERATION_RETRY_SLEEP));
+            locked = runningJobStateIMap.tryLock(jobId, 1, TimeUnit.SECONDS);
+            if (!locked) {
+                LOG.warn(
+                        "Timed out acquiring job state lock for {}, skip persisting transition to {}",
+                        jobId,
+                        targetStatus);
+                return;
+            }
+            if (runningJobStateIMap.get(jobId) == null) {
+                LOG.warn(
+                        "Job {} has already been cleaned, skip persisting transition to {}",
+                        jobId,
+                        targetStatus);
+                return;
+            }
+            Object currentStatus = runningJobStateIMap.get(checkpointStateImapKey);
+            LOG.info(
+                    "Turn {} state from {} to {}",
+                    checkpointStateImapKey,
+                    currentStatus,
+                    targetStatus);
+            runningJobStateIMap.set(checkpointStateImapKey, targetStatus);
         } catch (Exception e) {
             LOG.warn(
                     "Set {} state {} to IMap failed, skip do it",
                     checkpointStateImapKey,
                     targetStatus);
+        } finally {
+            if (locked) {
+                runningJobStateIMap.unlock(jobId);
+            }
         }
     }
 

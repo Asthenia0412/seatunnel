@@ -22,6 +22,7 @@ import org.apache.seatunnel.engine.checkpoint.storage.PipelineState;
 import org.apache.seatunnel.engine.checkpoint.storage.api.CheckpointStorage;
 import org.apache.seatunnel.engine.common.config.server.CheckpointConfig;
 import org.apache.seatunnel.engine.common.config.server.CheckpointStorageConfig;
+import org.apache.seatunnel.engine.common.job.JobStatus;
 import org.apache.seatunnel.engine.common.utils.concurrent.CompletableFuture;
 import org.apache.seatunnel.engine.core.checkpoint.CheckpointIDCounter;
 import org.apache.seatunnel.engine.core.checkpoint.CheckpointType;
@@ -978,6 +979,60 @@ public class CheckpointCoordinatorTest
                 }
             }
         } finally {
+            executorService.shutdownNow();
+        }
+    }
+
+    @Test
+    void testCoordinatorStatusIsCreatedForLiveJobAndNotRecreatedAfterCleanup() throws Exception {
+        long jobId = System.currentTimeMillis();
+        int pipelineId = 17;
+        String checkpointStateKey = "checkpoint_state_" + jobId + "_" + pipelineId;
+        IMap<Object, Object> runningJobStateIMap =
+                nodeEngine.getHazelcastInstance().getMap(IMAP_RUNNING_JOB_STATE);
+        runningJobStateIMap.put(jobId, JobStatus.RUNNING);
+
+        CheckpointConfig checkpointConfig = new CheckpointConfig();
+        checkpointConfig.setStorage(new CheckpointStorageConfig());
+        CheckpointPlan plan = CheckpointPlan.builder().pipelineId(pipelineId).build();
+        ExecutorService executorService = Executors.newSingleThreadExecutor();
+        try {
+            CheckpointCoordinator coordinator =
+                    new CheckpointCoordinator(
+                            Mockito.mock(CheckpointManager.class),
+                            Mockito.mock(CheckpointStorage.class),
+                            checkpointConfig,
+                            jobId,
+                            plan,
+                            Mockito.mock(CheckpointIDCounter.class),
+                            null,
+                            executorService,
+                            runningJobStateIMap,
+                            false,
+                            null);
+
+            ReflectionUtils.invoke(
+                    coordinator, "updateStatus", CheckpointCoordinatorStatus.RUNNING);
+
+            Assertions.assertEquals(
+                    CheckpointCoordinatorStatus.RUNNING,
+                    runningJobStateIMap.get(checkpointStateKey));
+
+            runningJobStateIMap.lock(jobId);
+            try {
+                runningJobStateIMap.remove(jobId);
+                runningJobStateIMap.remove(checkpointStateKey);
+            } finally {
+                runningJobStateIMap.unlock(jobId);
+            }
+
+            ReflectionUtils.invoke(
+                    coordinator, "updateStatus", CheckpointCoordinatorStatus.CANCELED);
+
+            Assertions.assertNull(runningJobStateIMap.get(checkpointStateKey));
+        } finally {
+            runningJobStateIMap.remove(jobId);
+            runningJobStateIMap.remove(checkpointStateKey);
             executorService.shutdownNow();
         }
     }

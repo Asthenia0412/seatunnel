@@ -56,6 +56,9 @@ import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
@@ -116,6 +119,72 @@ class CoordinatorServiceJobCleanupTest extends AbstractSeaTunnelServerTest {
         Assertions.assertNull(runningJobStateTimestampsIMap.get(pipelineLocation));
         Assertions.assertNull(runningJobStateTimestampsIMap.get(taskGroupLocation));
         Assertions.assertFalse(pendingJobCleanupIMap.containsKey(jobId));
+    }
+
+    @Test
+    void testCleanupDefersWhenJobStateLockIsBusy() throws Exception {
+        CoordinatorService coordinatorService = server.getCoordinatorService();
+        long jobId = System.currentTimeMillis();
+        PipelineLocation pipelineLocation = new PipelineLocation(jobId, 1);
+        String checkpointStateKey = "checkpoint_state_" + jobId + "_1";
+
+        IMap<Long, JobInfo> runningJobInfoIMap =
+                nodeEngine.getHazelcastInstance().getMap(Constant.IMAP_RUNNING_JOB_INFO);
+        IMap<Object, Object> runningJobStateIMap =
+                nodeEngine.getHazelcastInstance().getMap(Constant.IMAP_RUNNING_JOB_STATE);
+        IMap<Long, JobCleanupRecord> pendingJobCleanupIMap =
+                nodeEngine.getHazelcastInstance().getMap(Constant.IMAP_PENDING_JOB_CLEANUP);
+
+        runningJobInfoIMap.put(jobId, new JobInfo(100L, null));
+        runningJobStateIMap.put(jobId, JobStatus.FINISHED);
+        runningJobStateIMap.put(pipelineLocation, "pipeline");
+        runningJobStateIMap.put(checkpointStateKey, "checkpoint");
+        pendingJobCleanupIMap.put(
+                jobId,
+                new JobCleanupRecord(
+                        100L,
+                        JobStatus.FINISHED,
+                        stateKeys(jobId, pipelineLocation, checkpointStateKey),
+                        Collections.emptySet(),
+                        System.currentTimeMillis()));
+
+        CountDownLatch lockAcquired = new CountDownLatch(1);
+        CountDownLatch releaseLock = new CountDownLatch(1);
+        ExecutorService lockOwner = Executors.newSingleThreadExecutor();
+        try {
+            lockOwner.submit(
+                    () -> {
+                        runningJobStateIMap.lock(jobId);
+                        lockAcquired.countDown();
+                        try {
+                            releaseLock.await();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        } finally {
+                            runningJobStateIMap.unlock(jobId);
+                        }
+                    });
+            Assertions.assertTrue(lockAcquired.await(5, TimeUnit.SECONDS));
+
+            coordinatorService.runPendingJobCleanupOnce();
+
+            Assertions.assertTrue(pendingJobCleanupIMap.containsKey(jobId));
+            Assertions.assertEquals(JobStatus.FINISHED, runningJobStateIMap.get(jobId));
+            Assertions.assertNotNull(runningJobStateIMap.get(checkpointStateKey));
+
+            releaseLock.countDown();
+            await().atMost(5, TimeUnit.SECONDS)
+                    .untilAsserted(
+                            () -> {
+                                coordinatorService.runPendingJobCleanupOnce();
+                                Assertions.assertFalse(pendingJobCleanupIMap.containsKey(jobId));
+                                Assertions.assertNull(runningJobStateIMap.get(jobId));
+                                Assertions.assertNull(runningJobStateIMap.get(checkpointStateKey));
+                            });
+        } finally {
+            releaseLock.countDown();
+            lockOwner.shutdownNow();
+        }
     }
 
     @Test

@@ -132,6 +132,8 @@ import static org.apache.seatunnel.engine.server.metrics.JobMetricsUtil.toJobMet
 /** Coordinates job submission, scheduling, recovery, and event reporting on the master node. */
 public class CoordinatorService {
     private static final int PIPELINE_CLEANUP_INTERVAL_SECONDS = 60;
+    private static final long JOB_STATE_CLEANUP_LOCK_WAIT_MILLIS = 100L;
+    private static final long JOB_STATE_CLEANUP_RETRY_DELAY_SECONDS = 1L;
     private final NodeEngineImpl nodeEngine;
     private final SeaTunnelEngineContext engineContext;
     private final ILogger logger;
@@ -889,8 +891,11 @@ public class CoordinatorService {
 
         JobInfo currentJobInfo = runningJobInfoIMap.get(jobId);
         if (currentJobInfo == null) {
-            cleanupPendingJobStateMaps(record);
-            removePendingJobCleanupRecord(jobId, record);
+            if (cleanupPendingJobStateMaps(jobId, record)) {
+                removePendingJobCleanupRecord(jobId, record);
+            } else {
+                schedulePendingJobCleanupRetry(jobId);
+            }
             return;
         }
         if (!isCleanupOwnedByCurrentJob(currentJobInfo, jobId, record)) {
@@ -901,8 +906,11 @@ public class CoordinatorService {
         if (!runningJobInfoIMap.remove(jobId, currentJobInfo)) {
             JobInfo latestJobInfo = runningJobInfoIMap.get(jobId);
             if (latestJobInfo == null) {
-                cleanupPendingJobStateMaps(record);
-                removePendingJobCleanupRecord(jobId, record);
+                if (cleanupPendingJobStateMaps(jobId, record)) {
+                    removePendingJobCleanupRecord(jobId, record);
+                } else {
+                    schedulePendingJobCleanupRetry(jobId);
+                }
             } else if (!Objects.equals(
                     latestJobInfo.getInitializationTimestamp(),
                     record.getOwnerInitializationTimestamp())) {
@@ -911,8 +919,11 @@ public class CoordinatorService {
             return;
         }
 
-        cleanupPendingJobStateMaps(record);
-        removePendingJobCleanupRecord(jobId, record);
+        if (cleanupPendingJobStateMaps(jobId, record)) {
+            removePendingJobCleanupRecord(jobId, record);
+        } else {
+            schedulePendingJobCleanupRetry(jobId);
+        }
     }
 
     private void removePendingJobCleanupRecord(long jobId, JobCleanupRecord record) {
@@ -955,9 +966,53 @@ public class CoordinatorService {
         return jobState instanceof JobStatus && ((JobStatus) jobState).isEndState();
     }
 
-    private void cleanupPendingJobStateMaps(JobCleanupRecord record) {
-        removeKeys(runningJobStateIMap, record.getStateKeys());
-        removeKeys(runningJobStateTimestampsIMap, record.getTimestampKeys());
+    private boolean cleanupPendingJobStateMaps(long jobId, JobCleanupRecord record) {
+        boolean locked = false;
+        try {
+            locked =
+                    runningJobStateIMap.tryLock(
+                            jobId, JOB_STATE_CLEANUP_LOCK_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+            if (!locked) {
+                logger.info(
+                        String.format(
+                                "Job state cleanup for %s deferred because its state lock is busy",
+                                jobId));
+                return false;
+            }
+            removeKeys(runningJobStateIMap, record.getStateKeys());
+            removeKeys(runningJobStateTimestampsIMap, record.getTimestampKeys());
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.warning(
+                    String.format("Interrupted while acquiring job state lock for %s", jobId), e);
+            return false;
+        } finally {
+            if (locked) {
+                runningJobStateIMap.unlock(jobId);
+            }
+        }
+    }
+
+    private void schedulePendingJobCleanupRetry(long jobId) {
+        ScheduledExecutorService cleanupScheduler = seaTunnelServer.getMonitorService();
+        if (cleanupScheduler == null) {
+            cleanupScheduler = masterActiveListener;
+        }
+        cleanupScheduler.schedule(
+                () -> {
+                    try {
+                        processPendingJobCleanup(jobId, pendingJobCleanupIMap.get(jobId));
+                    } catch (Exception e) {
+                        logger.warning(
+                                String.format(
+                                        "Retried job cleanup failed for job %s: %s",
+                                        jobId, ExceptionUtils.getMessage(e)),
+                                e);
+                    }
+                },
+                JOB_STATE_CLEANUP_RETRY_DELAY_SECONDS,
+                TimeUnit.SECONDS);
     }
 
     private void removeKeys(IMap<Object, ?> map, Set<Object> keys) {
@@ -1175,13 +1230,25 @@ public class CoordinatorService {
         JobImmutableInformation jobImmutableInformation = restoreJobImmutableInformation(jobInfo);
         cleanupTerminalZombieCheckpointIfNecessary(jobId, jobImmutableInformation, finalStatus);
         persistTerminalZombieHistoryIfNecessary(jobId, jobImmutableInformation, finalStatus);
-        cleanupPendingJobStateMaps(createTerminalZombieCleanupRecord(jobId, jobInfo, finalStatus));
+        JobCleanupRecord cleanupRecord =
+                createTerminalZombieCleanupRecord(jobId, jobInfo, finalStatus);
+        if (cleanupPendingJobStateMaps(jobId, cleanupRecord)) {
+            removePendingJobCleanupRecord(jobId, cleanupRecord);
+        } else {
+            pendingJobCleanupIMap.put(jobId, cleanupRecord);
+            schedulePendingJobCleanupRetry(jobId);
+        }
         runningJobInfoIMap.remove(jobId);
     }
 
     private void cleanupPendingJobStateForRestore(long jobId, JobCleanupRecord record) {
-        removeKeys(runningJobStateIMap, record.getStateKeys());
-        removeKeys(runningJobStateTimestampsIMap, record.getTimestampKeys());
+        if (!cleanupPendingJobStateMaps(jobId, record)) {
+            schedulePendingJobCleanupRetry(jobId);
+            throw new JobException(
+                    String.format(
+                            "The job id %s cleanup is waiting for its state lock, please retry later.",
+                            jobId));
+        }
         removePendingJobCleanupRecord(jobId, record);
         runningJobInfoIMap.remove(jobId);
     }
